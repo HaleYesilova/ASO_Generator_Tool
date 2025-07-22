@@ -10,9 +10,13 @@ from collections import Counter
 import logging
 import asyncio
 from typing import Optional, List, Dict, Any
+import tempfile
+import base64
+import datetime
+import io
 
 # API anahtarı direkt kod içinde
-open_ai_key = #Kopyalaman gerekicek env'den
+open_ai_key = 
 # OpenAI client oluştur
 client = OpenAI(api_key=open_ai_key)
 
@@ -38,6 +42,7 @@ class Df_Get():
         Klasördeki tüm .csv dosyalarını birleştirir,
         Keyword, Volume ve Difficulty sütunlarına göre tekrarlı satırları kaldırır,
         tüm sütunları saklayarak bir DataFrame döndürür.
+        Title sütunu CSV dosya isimlerinden oluşturulur.
         """
         print("DEBUG: merged_noduplicate_df() başlatıldı. Klasör:", klasor_yolu)
         try:
@@ -50,10 +55,34 @@ class Df_Get():
             for dosya in csv_dosyalar:
                 df_temp = pd.read_csv(os.path.join(klasor_yolu, dosya))
                 print(f"DEBUG: {dosya} okundu, şekli: {df_temp.shape}")
+                
+                # Dosya adından Title oluştur
+                # "trending-keywords-US-Business.csv" -> "Business"
+                # "trending-keywords-US-Food & Drink.csv" -> "Food & Drink"
+                dosya_adi = dosya.replace('.csv', '')
+                parts = dosya_adi.split('-')
+                if len(parts) >= 4 and parts[0] == 'trending' and parts[1] == 'keywords':
+                    # US kısmından sonraki tüm kısımları birleştir
+                    title = '-'.join(parts[3:])  # US kısmından sonrasını al
+                else:
+                    # Fallback: dosya adının son kısmını al
+                    title = dosya_adi.split('-')[-1] if '-' in dosya_adi else dosya_adi
+                
+                # Title sütununu DataFrame'e ekle
+                df_temp['Title'] = title
+                print(f"DEBUG: {dosya} için Title: {title}")
+                
                 dataframes.append(df_temp)
 
             # Bütün CSV'ler birleştiriliyor
             birlesik_df = pd.concat(dataframes, ignore_index=True)
+            
+            # Title sütununu en başa taşı
+            cols = birlesik_df.columns.tolist()
+            if 'Title' in cols:
+                cols.remove('Title')
+                cols.insert(0, 'Title')
+                birlesik_df = birlesik_df[cols]
             
             # Öncelikle, Difficulty sütununa göre azalan sırayla sıralıyoruz
             birlesik_df.sort_values(by="Difficulty", ascending=False, inplace=True)
@@ -63,20 +92,27 @@ class Df_Get():
             birlesik_df.drop_duplicates(subset=["Keyword"], keep="first", ignore_index=True, inplace=True)
 
             print("DEBUG: Birleştirilmiş DataFrame şekli:", birlesik_df.shape)
+            print("DEBUG: Sütunlar:", birlesik_df.columns.tolist())
             return birlesik_df
 
         except Exception as e:
             raise ValueError(f"CSV birleştirme hatası: {e}")
         
     def kvd_df(df,limit):
-        df = df[(df["Volume"] >= 20) & (df["Difficulty"] <= limit)]
-        df.loc[:, "Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
-        df = df.dropna(subset=["Volume"])  
-        df["Volume"] = df["Volume"].astype(int)
-        df.sort_values(by="Volume", ascending=False, inplace=True)
-        df = df[["Keyword", "Volume", "Difficulty"]].dropna()
-        print("DEBUG: Filtrelenmiş ve sıralanmış KVD CSV:\n", df)
-        return df
+        df_filtered = df[(df["Volume"] >= 20) & (df["Difficulty"] <= limit)]
+        df_filtered.loc[:, "Volume"] = pd.to_numeric(df_filtered["Volume"], errors="coerce")
+        df_filtered = df_filtered.dropna(subset=["Volume"])  
+        df_filtered["Volume"] = df_filtered["Volume"].astype(int)
+        df_filtered.sort_values(by="Volume", ascending=False, inplace=True)
+        
+        # Title sütunu varsa koru, yoksa sadece temel sütunları al
+        if 'Title' in df_filtered.columns:
+            df_result = df_filtered[["Title", "Keyword", "Volume", "Difficulty"]].dropna()
+        else:
+            df_result = df_filtered[["Keyword", "Volume", "Difficulty"]].dropna()
+            
+        print("DEBUG: Filtrelenmiş ve sıralanmış KVD CSV:\n", df_result)
+        return df_result
 
     def kelime_frekans_df(df, openai_api_key):
         print("DEBUG: kelime_frekans_df() başlatıldı.")
@@ -84,6 +120,18 @@ class Df_Get():
         print("DEBUG: Birleştirilmiş kelimeler:", kelimeler)
         kelime_sayaci = Counter(kelimeler)
         df_kf = pd.DataFrame(kelime_sayaci.items(), columns=["Kelime", "Frekans"]).sort_values(by="Frekans", ascending=False)
+        
+        # Eğer orijinal df'de Title sütunu varsa, frekans tablosuna da ekle
+        if 'Title' in df.columns and not df.empty:
+            # En yaygın Title'ı kullan (basit yaklaşım)
+            most_common_title = df['Title'].mode().iloc[0] if len(df['Title'].mode()) > 0 else "Frequency"
+            df_kf['Title'] = most_common_title
+            # Title sütununu en başa taşı
+            cols = df_kf.columns.tolist()
+            cols.remove('Title')
+            cols.insert(0, 'Title')
+            df_kf = df_kf[cols]
+        
         print("DEBUG: Frekans DataFrame'i:\n", df_kf)
         return df_kf
 
@@ -165,6 +213,15 @@ Example:
             # Filtrelenmiş DataFrame'i oluştur
             filtered_df = df_kf[mask].copy()
             
+            # Title sütunu varsa koru
+            if 'Title' in df_kf.columns:
+                # Title sütununu en başta tut
+                cols = filtered_df.columns.tolist()
+                if 'Title' in cols and cols[0] != 'Title':
+                    cols.remove('Title')
+                    cols.insert(0, 'Title')
+                    filtered_df = filtered_df[cols]
+            
             print(f"DEBUG: Filtrelenmiş kelime sayısı: {len(filtered_df)}")
             return filtered_df
             
@@ -175,13 +232,27 @@ Example:
     def aggregate_frequencies(df):
         """
         Aynı kelimeleri birleştirerek frekans değerlerini toplar.
+        Title sütunu varsa korur.
         """
         try:
             if df is None or df.empty:
                 print("\033[31mHATA: Boş veya geçersiz DataFrame\033[0m")
                 return pd.DataFrame(columns=['Kelime', 'Frekans'])
 
-            aggregated_df = df.groupby("Kelime", as_index=False)["Frekans"].sum()
+            # Title sütunu varsa koru
+            if 'Title' in df.columns:
+                # Önce Title'ı al
+                title_value = df['Title'].iloc[0] if not df.empty else "Aggregated"
+                # Kelime bazında grupla
+                aggregated_df = df.groupby("Kelime", as_index=False)["Frekans"].sum()
+                # Title'ı geri ekle
+                aggregated_df['Title'] = title_value
+                # Title'ı en başa taşı
+                cols = ['Title', 'Kelime', 'Frekans']
+                aggregated_df = aggregated_df[cols]
+            else:
+                aggregated_df = df.groupby("Kelime", as_index=False)["Frekans"].sum()
+            
             print("\033[32mDEBUG: Frekanslar birleştirildi.\033[0m")
             return aggregated_df
         
@@ -263,6 +334,12 @@ Example:
                         'Kelime': base_form_list,
                         'Frekans': kf_df['Frekans']
                     })
+                    
+                    # Title sütunu varsa koru
+                    if 'Title' in kf_df.columns:
+                        title_value = kf_df['Title'].iloc[0] if not kf_df.empty else "Suffixes"
+                        result_df['Title'] = title_value
+                    
                     result_df = Df_Get.aggregate_frequencies(result_df)
                     result_df = result_df.sort_values(by='Frekans', ascending=False)
 
@@ -846,16 +923,25 @@ class ASOApp:
                     self.data_table
                 ], scroll=ScrollMode.AUTO),
             ], scroll=ScrollMode.AUTO),
-            height=500,
+            height=350,  # Yükseklik azaltıldı
             border=ft.border.all(1, Colors.GREY_300),
             border_radius=10,
             padding=10,
             expand=True  # Responsive genişlik
         )
         
+        # Dosya adı girişi
+        self.filename_input = ft.TextField(
+            label="Dosya Adı (isteğe bağlı)",
+            hint_text="aso_table",
+            value="",
+            expand=True,
+            height=45
+        )
+        
         # Export button - Responsive
         self.export_button = ft.ElevatedButton(
-            "Tabloyu Dışa Aktar",
+            "📥 Excel İndir",
             on_click=self.export_table,
             style=ft.ButtonStyle(
                 color=Colors.WHITE,
@@ -863,19 +949,37 @@ class ASOApp:
                 elevation=2,
                 shape=ft.RoundedRectangleBorder(radius=8)
             ),
-            height=45
-            # width kaldırıldı - responsive olacak
+            height=45,
+            width=150
         )
         
         return ft.Column([
             self.table_title,
-            ft.Divider(height=20),
+            ft.Divider(height=10),
             table_container,
-            ft.Divider(height=20),
-            ft.Row([
-                self.export_button
-            ], alignment=ft.MainAxisAlignment.END)
-        ], spacing=10, expand=True)
+            ft.Divider(height=10),
+            # Export bölümü - Daha üstte
+            ft.Container(
+                content=ft.Column([
+                    ft.Text(
+                        "📁 Dosya İndirme",
+                        size=14,
+                        weight=FontWeight.BOLD,
+                        color=Colors.BLUE_700
+                    ),
+                    ft.Row([
+                        self.filename_input,
+                        ft.Container(width=10),
+                        self.export_button
+                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+                ], spacing=5),
+                bgcolor=Colors.ORANGE_50,
+                border=ft.border.all(1, Colors.ORANGE_200),
+                border_radius=8,
+                padding=15,
+                margin=ft.margin.only(bottom=10)
+            )
+        ], spacing=5, expand=True)
     
     # Event handlers
     def on_folder_selected(self, e: ft.FilePickerResultEvent):
@@ -983,16 +1087,46 @@ class ASOApp:
     
     def show_merged_table(self, e):
         if self.merged_noduplicate_df is None:
-            self.show_warning("Önce verileri yükleyin!")
-            return
+            # Test için sample CSV'leri otomatik yükle
+            try:
+                sample_path = "/Users/halenuryesilova/Downloads/ASO_Generator_Tool/sample_CSV_archive"
+                self.folder_path = sample_path
+                self.show_loading("Test verileri yükleniyor...")
+                self.merged_noduplicate_df = Df_Get.merged_noduplicate_df(sample_path)
+                self.hide_loading()
+                self.show_success("Test verileri yüklendi!")
+            except Exception as ex:
+                self.hide_loading()
+                self.show_error(f"Test veri yükleme hatası: {str(ex)}")
+                return
         
         self.display_dataframe(self.merged_noduplicate_df, "Birleştirilmiş Ana Tablo")
         self.current_table = self.merged_noduplicate_df
     
     def show_kvd_table(self, e):
         if self.kvd_df is None:
-            self.show_warning("Önce verileri yükleyin!")
-            return
+            # Önce merged_df'i yükle
+            if self.merged_noduplicate_df is None:
+                try:
+                    sample_path = "/Users/halenuryesilova/Downloads/ASO_Generator_Tool/sample_CSV_archive"
+                    self.folder_path = sample_path
+                    self.show_loading("Test verileri yükleniyor...")
+                    self.merged_noduplicate_df = Df_Get.merged_noduplicate_df(sample_path)
+                    self.hide_loading()
+                except Exception as ex:
+                    self.hide_loading()
+                    self.show_error(f"Veri yükleme hatası: {str(ex)}")
+                    return
+            
+            # KVD tablosunu oluştur
+            try:
+                self.show_loading("KVD tablosu oluşturuluyor...")
+                self.kvd_df = Df_Get.kvd_df(self.merged_noduplicate_df, self.difficulty_limit)
+                self.hide_loading()
+            except Exception as ex:
+                self.hide_loading()
+                self.show_error(f"KVD tablo oluşturma hatası: {str(ex)}")
+                return
         
         self.display_dataframe(self.kvd_df, "Keyword Volume Difficulty Tablosu")
         self.current_table = self.kvd_df
@@ -1076,6 +1210,16 @@ class ASOApp:
         
         # Add columns with dynamic width
         for col in df.columns:
+            # Title sütunu için özel genişlik
+            if col == 'Title':
+                column_width = 120
+            elif col == 'Keyword':
+                column_width = 200
+            elif col in ['Volume', 'Difficulty', 'Frekans']:
+                column_width = 100
+            else:
+                column_width = 150
+                
             self.data_table.columns.append(
                 ft.DataColumn(
                     ft.Text(
@@ -1110,17 +1254,85 @@ class ASOApp:
             return
         
         try:
-            # For now, save to desktop with timestamp
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"aso_table_{timestamp}.csv"
-            filepath = os.path.join(os.path.expanduser("~"), "Desktop", filename)
+            # Kullanıcının girdiği dosya adını al, yoksa varsayılan ad kullan
+            custom_filename = self.filename_input.value.strip()
+            if custom_filename:
+                # Güvenli dosya adı oluştur (özel karakterleri temizle)
+                import re
+                safe_filename = re.sub(r'[<>:"/\\|?*]', '_', custom_filename)
+                base_filename = safe_filename
+            else:
+                base_filename = "aso_table"
             
-            self.current_table.to_csv(filepath, index=False)
-            self.show_success(f"Tablo dışa aktarıldı: {filepath}")
+            # Timestamp ekle
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{base_filename}_{timestamp}.xlsx"
+            
+            self.show_loading(f"Excel dosyası hazırlanıyor: {filename}")
+            
+            # Create Excel file in memory
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                self.current_table.to_excel(writer, index=False, sheet_name='ASO Data')
+            
+            excel_data = buffer.getvalue()
+            
+            # Save to project directory and Desktop
+            project_path = os.path.join(os.getcwd(), filename)
+            desktop_path = os.path.join(os.path.expanduser("~"), "Desktop", filename)
+            
+            # Save Excel files
+            with open(project_path, 'wb') as f:
+                f.write(excel_data)
+            
+            try:
+                with open(desktop_path, 'wb') as f:
+                    f.write(excel_data)
+                self.hide_loading()
+                self.show_success(f"✅ Excel dosyası kaydedildi!\n📁 Proje: {filename}\n🖥️ Masaüstü: {filename}")
+            except PermissionError:
+                self.hide_loading()
+                self.show_success(f"✅ Excel dosyası proje klasörüne kaydedildi: {filename}")
+            
+            # Dosya adı alanını temizle
+            self.filename_input.value = ""
+            self.page.update()
             
         except Exception as ex:
-            self.show_error(f"Dışa aktarma hatası: {str(ex)}")
+            self.hide_loading()
+            # Excel başarısız olursa CSV'ye geç
+            try:
+                custom_filename = self.filename_input.value.strip()
+                if custom_filename:
+                    import re
+                    safe_filename = re.sub(r'[<>:"/\\|?*]', '_', custom_filename)
+                    base_filename = safe_filename
+                else:
+                    base_filename = "aso_table"
+                
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                csv_filename = f"{base_filename}_{timestamp}.csv"
+                csv_project_path = os.path.join(os.getcwd(), csv_filename)
+                csv_desktop_path = os.path.join(os.path.expanduser("~"), "Desktop", csv_filename)
+                
+                # Save CSV files
+                self.current_table.to_csv(csv_project_path, index=False)
+                
+                try:
+                    self.current_table.to_csv(csv_desktop_path, index=False)
+                    self.show_warning(f"⚠️ Excel başarısız, CSV kaydedildi!\n📁 Proje: {csv_filename}\n🖥️ Masaüstü: {csv_filename}")
+                except PermissionError:
+                    self.show_warning(f"⚠️ Excel başarısız, CSV proje klasörüne kaydedildi: {csv_filename}")
+                
+                # Dosya adı alanını temizle
+                self.filename_input.value = ""
+                self.page.update()
+                    
+            except Exception as csv_ex:
+                self.show_error(f"❌ Dosya kaydetme başarısız: {str(csv_ex)}")
+                # Dosya adı alanını temizle
+                self.filename_input.value = ""
+                self.page.update()
     
     # Utility methods
     def show_loading(self, message: str):
@@ -1159,4 +1371,4 @@ def main(page: ft.Page):
     ASOApp(page)
 
 if __name__ == "__main__":
-    ft.app(target=main, view=ft.AppView.FLET_APP) 
+    ft.app(target=main, view=ft.AppView.WEB_BROWSER) 
